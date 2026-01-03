@@ -1,3 +1,4 @@
+
 export const DEFAULT_CONFIG = {
   fps: 30,
   bpm: 140,
@@ -13,6 +14,9 @@ export const COLORS = [
   '#f43f5e', // Rose
   '#eab308', // Yellow
   '#3b82f6', // Blue
+  '#84cc16', // Lime
+  '#ec4899', // Pink
+  '#6366f1', // Indigo
 ];
 
 export const DEFAULT_REFINEMENT = {
@@ -21,6 +25,5 @@ export const DEFAULT_REFINEMENT = {
   smooth: 0,
   gate: 0,
   clip: true,
-  invert: false,
-  quantize: 0
+  invert: false
 };

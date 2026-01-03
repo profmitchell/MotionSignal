@@ -1,3 +1,4 @@
+
 export interface AudioFile {
   id: string;
   file: File;
@@ -30,14 +31,15 @@ export interface RefinementSettings {
   gate: number; // 0 to 1
   clip: boolean;
   invert: boolean;
-  quantize: number; // 0 (off), 4, 8, 16
 }
 
 export interface ChannelState {
   id: string;
   settings: RefinementSettings;
   processedValues: Float32Array; // Cached processed result
-  visible: boolean;
+  visible: boolean; // Main visibility toggle (like an eye)
+  mute: boolean;
+  solo: boolean;
   color: string;
 }
 
@@ -45,8 +47,4 @@ export interface ProjectData {
   config: AnalysisConfig;
   rawChannels: RawChannelData[];
   channelStates: Record<string, ChannelState>;
-  events: {
-    kicks: number[];
-    snares: number[];
-  }
 }

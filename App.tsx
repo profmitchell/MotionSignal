@@ -1,4 +1,5 @@
-import React, { useState, useCallback, useRef, useEffect } from 'react';
+
+import React, { useState, useCallback, useRef, useEffect, useMemo } from 'react';
 import { 
   AudioFile, 
   AnalysisConfig, 
@@ -10,7 +11,7 @@ import { DEFAULT_CONFIG, DEFAULT_REFINEMENT, COLORS } from './constants';
 import { decodeAudioFile, analyzeAudioBuffer, refineChannel } from './services/dsp';
 import Timeline from './components/Timeline';
 import Controls from './components/Controls';
-import { Upload, Music, Settings, Download, Play, Pause, Activity } from 'lucide-react';
+import { Upload, Music, Settings, Download, Play, Pause, Activity, FileJson, FileCode } from 'lucide-react';
 
 export default function App() {
   const [view, setView] = useState<'import' | 'analyze' | 'refine'>('import');
@@ -33,9 +34,6 @@ export default function App() {
       const newFiles: AudioFile[] = [];
       for (let i = 0; i < e.target.files.length; i++) {
         const file = e.target.files[i];
-        // We defer full decoding until analyze step to save memory, 
-        // but we need basic metadata? WebAudio decode is fast enough usually.
-        // Let's create the object placeholder.
         newFiles.push({
           id: Math.random().toString(36).substr(2, 9),
           file,
@@ -61,13 +59,10 @@ export default function App() {
         const f = files[i];
         const buffer = await decodeAudioFile(f.file);
         
-        // Update file metadata for display
         f.duration = buffer.duration;
         f.sampleRate = buffer.sampleRate;
         f.channels = buffer.numberOfChannels;
-        f.buffer = buffer; // Keep ref for now if needed, but we might want to drop it to save RAM? 
-                           // For 'Audio -> AE' we don't strictly need to play audio in browser, 
-                           // but seeing the wave helps. Let's keep it in DSP context only.
+        f.buffer = buffer; 
         
         setAnalyzeProgress(((i + 0.5) / files.length) * 100);
         const channels = await analyzeAudioBuffer(buffer, config, f.type === 'master' ? 'master' : f.id, f.name.replace('.wav', ''));
@@ -76,12 +71,13 @@ export default function App() {
       
       setRawChannels(results);
       
-      // Initialize states
       const initialStates: ChannelState[] = results.map((raw, idx) => ({
         id: raw.id,
         settings: { ...DEFAULT_REFINEMENT },
-        processedValues: raw.values, // Initially same as raw
-        visible: idx < 3, // Show first few by default
+        processedValues: raw.values,
+        visible: true,
+        mute: false,
+        solo: false,
         color: COLORS[idx % COLORS.length]
       }));
       setChannelStates(initialStates);
@@ -100,10 +96,8 @@ export default function App() {
   const updateRefinement = useCallback((id: string, settings: RefinementSettings) => {
     setChannelStates(prev => prev.map(ch => {
       if (ch.id === id) {
-        // Find raw data
         const raw = rawChannels.find(r => r.id === id);
         if (!raw) return ch;
-        // Re-process
         const processed = refineChannel(raw.values, settings, config.bpm, config.fps);
         return { ...ch, settings, processedValues: processed };
       }
@@ -111,18 +105,50 @@ export default function App() {
     }));
   }, [rawChannels, config]);
 
-  const toggleVisibility = (id: string) => {
-    setChannelStates(prev => prev.map(ch => ch.id === id ? { ...ch, visible: !ch.visible } : ch));
+  const toggleChannelState = (id: string, key: 'visible' | 'mute' | 'solo') => {
+    setChannelStates(prev => {
+        // Handle Exclusive Solo Logic? Or additive? Additive is more DAW-like usually.
+        // Let's keep it simple.
+        return prev.map(ch => ch.id === id ? { ...ch, [key]: !ch[key] } : ch);
+    });
   };
 
-  // Playback Logic (Visual only)
+  // Compute actual visible channels based on Mute/Solo
+  const visibleChannels = useMemo(() => {
+    const anySolo = channelStates.some(ch => ch.solo);
+    return channelStates.map(ch => {
+        // If the eye is off, it's off.
+        if (!ch.visible) return { ...ch, visible: false };
+
+        // If any channel is soloed
+        if (anySolo) {
+            return { ...ch, visible: ch.solo };
+        }
+        
+        // Otherwise check mute
+        return { ...ch, visible: !ch.mute };
+    });
+  }, [channelStates]);
+
+  // Current value for the "Signal Preview" box
+  const currentSignalValue = useMemo(() => {
+    if (!selectedChannelId) return 0;
+    const ch = channelStates.find(c => c.id === selectedChannelId);
+    if (!ch) return 0;
+    const frame = Math.floor(currentTime * config.fps);
+    if (frame >= 0 && frame < ch.processedValues.length) {
+        return ch.processedValues[frame];
+    }
+    return 0;
+  }, [selectedChannelId, currentTime, channelStates, config.fps]);
+
+
   useEffect(() => {
     const animate = (time: number) => {
       if (lastTimeRef.current !== undefined) {
         const delta = (time - lastTimeRef.current) / 1000;
         setCurrentTime(prev => {
             const next = prev + delta;
-            // Loop roughly or stop at end
             const maxDur = Math.max(...files.map(f => f.duration || 0)) || 10;
             return next > maxDur ? 0 : next;
         });
@@ -144,8 +170,9 @@ export default function App() {
 
   const exportData = () => {
     if (!channelStates.length) return;
+    const jsonName = `motion_data_${config.bpm}bpm.json`;
     
-    // 1. Prepare and Download JSON
+    // 1. JSON Export
     const exportObj = {
         metadata: {
             fps: config.fps,
@@ -158,7 +185,6 @@ export default function App() {
     };
 
     channelStates.forEach(ch => {
-        // Convert Float32Array to regular array for JSON
         exportObj.channels[ch.id] = Array.from(ch.processedValues).map(v => Number(v.toFixed(4)));
     });
 
@@ -166,44 +192,89 @@ export default function App() {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `motion_data_${config.bpm}bpm.json`;
+    a.download = jsonName;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
     
-    // 2. Prepare and Download TXT Helper (Delayed to prevent browser blocking)
+    // 2. ExtendScript (.jsx) Export
     setTimeout(() => {
-        let aeText = `// INSTRUCTIONS FOR AFTER EFFECTS:\n`;
-        aeText += `// 1. File > Scripts > Run Script File... (Use a JSON importer script or AE 2023+ generic JSON import)\n`;
-        aeText += `// 2. Rename the imported JSON layer to "motion_data"\n`;
-        aeText += `// 3. Create a Null Object named "CONTROLLER"\n`;
-        aeText += `// 4. Add Slider Controls to "CONTROLLER" for each channel below.\n`;
-        aeText += `// 5. Alt-click the stopwatch and paste these expressions:\n\n`;
-        
+        let script = `
+        {
+            app.beginUndoGroup("Create Motion Controller");
+            
+            // 1. Find JSON Footage Item
+            var proj = app.project;
+            var jsonItem = null;
+            
+            // Check selection first
+            if (proj.selection.length > 0) {
+                if (proj.selection[0].name.indexOf(".json") !== -1) {
+                    jsonItem = proj.selection[0];
+                }
+            }
+            
+            if (!jsonItem) {
+                // Try to find by name
+                for (var i = 1; i <= proj.numItems; i++) {
+                    if (proj.item(i).name === "${jsonName}") {
+                        jsonItem = proj.item(i);
+                        break;
+                    }
+                }
+            }
+            
+            if (!jsonItem) {
+                alert("Please import and select '${jsonName}' in the project bin before running this script.");
+            } else {
+                // 2. Get/Create Comp
+                var comp = proj.activeItem;
+                if (!comp || !(comp instanceof CompItem)) {
+                    // Create a comp if none active
+                    comp = proj.items.addComp("Motion Data Comp", 1920, 1080, 1, ${rawChannels[0].values.length / config.fps}, ${config.fps});
+                    comp.openInViewer();
+                }
+                
+                // 3. Create Controller
+                var controllerName = "MOTION_CONTROLLER";
+                var layer = comp.layers.addNull();
+                layer.name = controllerName;
+                layer.label = 11; // Orange label
+                
+                // 4. Add Sliders & Expressions
+        `;
+
         channelStates.forEach(ch => {
-            aeText += `// --- ${ch.id} ---\n`;
-            aeText += `var data = footage("motion_data_${config.bpm}bpm.json").sourceData;\n`;
-            aeText += `var frame = timeToFrames(time);\n`;
-            aeText += `try { data.channels["${ch.id}"][frame] * 100; } catch(e) { 0; }\n\n`;
+            script += `
+                var s = layer.Effects.addProperty("ADBE Slider Control");
+                s.name = "${ch.id}";
+                s.property(1).expression = 'try { footage("' + jsonItem.name + '").sourceData.channels["${ch.id}"][timeToFrames(time)] * 100 } catch(e) { 0; }';
+            `;
         });
 
-        const txtBlob = new Blob([aeText], { type: 'text/plain' });
-        const txtUrl = URL.createObjectURL(txtBlob);
-        const txtA = document.createElement('a');
-        txtA.href = txtUrl;
-        txtA.download = `AE_Expressions_Helper.txt`;
-        document.body.appendChild(txtA);
-        txtA.click();
-        document.body.removeChild(txtA);
-        URL.revokeObjectURL(txtUrl);
-    }, 1000); // 1 second delay to ensure both downloads trigger
+        script += `
+            }
+            app.endUndoGroup();
+        }
+        `;
+
+        const scriptBlob = new Blob([script], { type: 'text/javascript' });
+        const scriptUrl = URL.createObjectURL(scriptBlob);
+        const sa = document.createElement('a');
+        sa.href = scriptUrl;
+        sa.download = "Create_AE_Controller.jsx";
+        document.body.appendChild(sa);
+        sa.click();
+        document.body.removeChild(sa);
+        URL.revokeObjectURL(scriptUrl);
+    }, 1000);
   };
 
   return (
     <div className="flex flex-col h-screen bg-zinc-950 text-zinc-100 font-sans">
         {/* Header */}
-        <header className="h-14 border-b border-zinc-800 flex items-center justify-between px-6 bg-zinc-950">
+        <header className="h-14 border-b border-zinc-800 flex items-center justify-between px-6 bg-zinc-950 flex-shrink-0">
             <div className="flex items-center gap-2">
                 <Activity className="text-cyan-500" size={20} />
                 <h1 className="font-bold tracking-tight text-lg">MotionSignal</h1>
@@ -312,7 +383,7 @@ export default function App() {
             {view === 'refine' && (
                 <div className="absolute inset-0 flex flex-row animate-in fade-in duration-700">
                     {/* Sidebar Channels */}
-                    <div className="w-64 bg-zinc-900 border-r border-zinc-800 flex flex-col min-h-0">
+                    <div className="w-64 bg-zinc-900 border-r border-zinc-800 flex flex-col min-h-0 z-20">
                         <div className="p-4 border-b border-zinc-800">
                             <h3 className="text-xs font-bold text-zinc-400 uppercase tracking-wider">Channels</h3>
                         </div>
@@ -322,22 +393,41 @@ export default function App() {
                                     key={ch.id}
                                     onClick={() => setSelectedChannelId(ch.id)}
                                     className={`
-                                        flex items-center gap-3 p-2 rounded cursor-pointer transition-colors
+                                        flex items-center gap-2 p-2 rounded cursor-pointer transition-colors group
                                         ${selectedChannelId === ch.id ? 'bg-zinc-800 ring-1 ring-zinc-700' : 'hover:bg-zinc-800/50'}
                                     `}
                                 >
                                     <div 
-                                        className={`w-3 h-3 rounded-full border border-zinc-950 shadow-sm`}
+                                        className={`w-3 h-3 rounded-full border border-zinc-950 shadow-sm flex-shrink-0 cursor-pointer`}
                                         style={{ backgroundColor: ch.color }}
                                         onClick={(e) => {
                                             e.stopPropagation();
-                                            toggleVisibility(ch.id);
+                                            toggleChannelState(ch.id, 'visible');
                                         }}
                                     >
                                         {!ch.visible && <div className="w-full h-full bg-zinc-950 rounded-full opacity-80" />}
                                     </div>
+                                    
                                     <div className="flex-1 min-w-0">
-                                        <p className="text-xs font-medium text-zinc-200 truncate">{ch.id}</p>
+                                        <p className={`text-xs font-medium truncate ${selectedChannelId === ch.id ? 'text-zinc-100' : 'text-zinc-400'}`}>
+                                            {ch.id}
+                                        </p>
+                                    </div>
+
+                                    {/* Mute / Solo Buttons */}
+                                    <div className="flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                                        <button 
+                                            onClick={(e) => { e.stopPropagation(); toggleChannelState(ch.id, 'mute'); }}
+                                            className={`text-[9px] w-4 h-4 rounded flex items-center justify-center font-bold ${ch.mute ? 'bg-red-500/20 text-red-500' : 'bg-zinc-800 text-zinc-500 hover:bg-zinc-700'}`}
+                                        >
+                                            M
+                                        </button>
+                                        <button 
+                                             onClick={(e) => { e.stopPropagation(); toggleChannelState(ch.id, 'solo'); }}
+                                            className={`text-[9px] w-4 h-4 rounded flex items-center justify-center font-bold ${ch.solo ? 'bg-yellow-500/20 text-yellow-500' : 'bg-zinc-800 text-zinc-500 hover:bg-zinc-700'}`}
+                                        >
+                                            S
+                                        </button>
                                     </div>
                                 </div>
                             ))}
@@ -345,9 +435,9 @@ export default function App() {
                     </div>
 
                     {/* Main Area */}
-                    <div className="flex-1 flex flex-col bg-zinc-950 min-w-0">
+                    <div className="flex-1 flex flex-col bg-zinc-950 min-w-0 min-h-0">
                         {/* Toolbar */}
-                        <div className="h-12 border-b border-zinc-800 flex items-center justify-between px-4 bg-zinc-950">
+                        <div className="h-12 border-b border-zinc-800 flex items-center justify-between px-4 bg-zinc-950 flex-shrink-0">
                             <div className="flex items-center gap-2">
                                 <button 
                                     onClick={() => setIsPlaying(!isPlaying)}
@@ -362,15 +452,15 @@ export default function App() {
                                 className="flex items-center gap-2 px-4 py-1.5 bg-cyan-900/30 text-cyan-400 border border-cyan-900/50 rounded hover:bg-cyan-900/50 transition-colors text-sm font-medium"
                             >
                                 <Download size={16} />
-                                Export JSON
+                                Export JSON + Script
                             </button>
                         </div>
 
                         {/* Visualizer */}
-                        <div className="flex-1 p-4 overflow-hidden min-h-0">
+                        <div className="flex-1 p-4 overflow-hidden relative min-h-0">
                             {rawChannels.length > 0 && (
                                 <Timeline 
-                                    channels={channelStates} 
+                                    channels={visibleChannels} 
                                     duration={files.reduce((acc, f) => Math.max(acc, f.duration), 0)}
                                     config={config}
                                     currentTime={currentTime}
@@ -384,6 +474,7 @@ export default function App() {
                     <Controls 
                         selectedChannelId={selectedChannelId} 
                         channel={channelStates.find(c => c.id === selectedChannelId)}
+                        currentValue={currentSignalValue}
                         onUpdate={updateRefinement}
                     />
                 </div>
